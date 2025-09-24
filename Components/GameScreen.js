@@ -11,32 +11,42 @@ import {
   TouchableWithoutFeedback,
   Keyboard,
   Pressable,
+  Alert,
 } from 'react-native';
 import * as Animatable from 'react-native-animatable';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import quotes from '../assets/quotes_500.json';
 
-const QUOTE_PROGRESS_KEY = 'quote_progress';
-const QUOTE_TIMER_KEY = 'quote_timer';
+const QUOTE_LEVEL_KEY = 'quote_level';       // <- current active level
+const QUOTE_PROGRESS_KEY = 'quote_progress'; // <- single active save (guesses for current level)
+const QUOTE_TIMER_KEY = 'quote_timer';       // <- single active timer (for current level)
+const QUOTE_UNLOCK_KEY = 'quote_unlocked';   // <- highest unlocked level { unlockedLevel: number }
 
-const QuoteScreen = () => {
-  const [quote, setQuote] = useState({
-    q: "Do not spoil what you have by desiring what you have not.",
-    a: "Epicurus",
-  });
+export default function GameScreen({ route, navigation }) {
+  // Safe default to level 0 if params not provided
+  const levelIndex = route?.params?.levelIndex ?? 0;
+  const quote = quotes[levelIndex];
+
+  // Count only letters for fairness
+  const letterCount = (quote.q.match(/[a-zA-Z]/g) || []).length;
+  const MAX_WRONG = Math.max(5, Math.floor(letterCount * 0.15)); // ~15% of letters, min 5
 
   const [loading, setLoading] = useState(true);
-  const [guessedLetters, setGuessedLetters] = useState([]);
-  const [guess, setGuess] = useState('');
-  const [wrongGuesses, setWrongGuesses] = useState([]);
-  const [shuffledAlphabet, setShuffledAlphabet] = useState([]);
-  const [selectedIndex, setSelectedIndex] = useState(null);
   const [charMap, setCharMap] = useState([]);
+
+  const [guessedLetters, setGuessedLetters] = useState([]); // [{index, letter}]
+  const [wrongGuesses, setWrongGuesses] = useState([]);     // [{index, letter}]
+  const [selectedIndex, setSelectedIndex] = useState(null);
   const [previewLetter, setPreviewLetter] = useState('');
   const [lastGuessFeedback, setLastGuessFeedback] = useState(null);
+
+  const [shuffledAlphabet, setShuffledAlphabet] = useState([]);
   const [secondsElapsed, setSecondsElapsed] = useState(0);
+
   const inputRef = useRef(null);
   const timerRef = useRef(null);
 
+  // ---------- utils ----------
   const shuffleAlphabet = () => {
     const alphabet = 'abcdefghijklmnopqrstuvwxyz'.split('');
     for (let i = alphabet.length - 1; i > 0; i--) {
@@ -50,9 +60,10 @@ const QuoteScreen = () => {
     if (timerRef.current) return;
     timerRef.current = setInterval(() => {
       setSecondsElapsed(prev => {
-        const newTime = prev + 1;
-        AsyncStorage.setItem(QUOTE_TIMER_KEY, JSON.stringify(newTime));
-        return newTime;
+        const t = prev + 1;
+        // single active save → always save under one key
+        AsyncStorage.setItem(QUOTE_TIMER_KEY, JSON.stringify(t));
+        return t;
       });
     }, 1000);
   };
@@ -70,107 +81,185 @@ const QuoteScreen = () => {
     await AsyncStorage.removeItem(QUOTE_TIMER_KEY);
   };
 
+  const clearActiveSave = async () => {
+    await AsyncStorage.multiRemove([QUOTE_PROGRESS_KEY, QUOTE_TIMER_KEY]);
+  };
+
+  const persistProgress = async (newGuessed, newWrong) => {
+    await AsyncStorage.setItem(
+      QUOTE_PROGRESS_KEY,
+      JSON.stringify({
+        levelIndex,
+        guessedLetters: newGuessed,
+        wrongGuesses: newWrong,
+      })
+    );
+  };
+
+  // ---------- initial setup / level switching ----------
   useEffect(() => {
-    const loadProgress = async () => {
+    let mounted = true;
+
+    const setup = async () => {
       try {
-        const [savedProgress, savedTime] = await Promise.all([
-          AsyncStorage.getItem(QUOTE_PROGRESS_KEY),
-          AsyncStorage.getItem(QUOTE_TIMER_KEY),
-        ]);
-
-        if (savedProgress) {
-          const parsed = JSON.parse(savedProgress);
-          setGuessedLetters(parsed.guessedLetters || []);
-          setWrongGuesses(parsed.wrongGuesses || []);
-        }
-
-        if (savedTime) {
-          setSecondsElapsed(parseInt(savedTime));
-        }
-
-        startTimer();
-      } catch (e) {
-        console.error('Failed to load progress:', e);
-      }
-    };
-
-    const setupQuote = () => {
-      const mapped = [];
-      let globalIndex = 0;
-      const words = quote.q.split(' ');
-      words.forEach((word, wordIndex) => {
-        word.split('').forEach((char) => {
-          mapped.push({
-            char,
-            index: globalIndex,
-            wordIndex,
-            isLetter: /[a-zA-Z]/.test(char),
+        // Build char map for the current quote
+        const mapped = [];
+        let globalIndex = 0;
+        const words = quote.q.split(' ');
+        words.forEach((word, wordIndex) => {
+          word.split('').forEach((char) => {
+            mapped.push({
+              char,
+              index: globalIndex,
+              wordIndex,
+              isLetter: /[a-zA-Z]/.test(char),
+            });
+            globalIndex++;
           });
-          globalIndex++;
+          if (wordIndex < words.length - 1) {
+            mapped.push({ char: ' ', index: globalIndex, isLetter: false, wordIndex });
+            globalIndex++;
+          }
         });
-        if (wordIndex < words.length - 1) {
-          mapped.push({ char: ' ', index: globalIndex, isLetter: false, wordIndex });
-          globalIndex++;
+        if (!mounted) return;
+        setCharMap(mapped);
+
+        // Check current active level
+        const storedLevel = await AsyncStorage.getItem(QUOTE_LEVEL_KEY);
+        const storedLevelIndex = storedLevel !== null ? Number(storedLevel) : null;
+
+        if (storedLevelIndex === levelIndex) {
+          // Same level as the one saved → restore progress + timer
+          const [savedProgress, savedTime] = await Promise.all([
+            AsyncStorage.getItem(QUOTE_PROGRESS_KEY),
+            AsyncStorage.getItem(QUOTE_TIMER_KEY),
+          ]);
+
+          if (savedProgress) {
+            const parsed = JSON.parse(savedProgress);
+            // Safety: ensure the saved slot is indeed for this level
+            if (parsed.levelIndex === levelIndex) {
+              setGuessedLetters(parsed.guessedLetters || []);
+              setWrongGuesses(parsed.wrongGuesses || []);
+            } else {
+              // Mismatch (rare) → clear and start fresh
+              await clearActiveSave();
+            }
+          }
+
+          if (savedTime) {
+            setSecondsElapsed(parseInt(savedTime, 10) || 0);
+          }
+        } else {
+          // Different level selected → clear the single active save
+          await clearActiveSave();
+          await AsyncStorage.setItem(QUOTE_LEVEL_KEY, String(levelIndex));
+
+          // Prefill 10% (min 3) for a fresh run and immediately persist so it resumes after relaunch
+          const letters = mapped.filter(c => c.isLetter);
+          const numToPrefill = Math.max(3, Math.floor(letters.length * 0.1));
+          const chosen = new Set();
+          while (chosen.size < numToPrefill) {
+            const r = Math.floor(Math.random() * letters.length);
+            chosen.add(letters[r].index);
+          }
+          const prefilled = Array.from(chosen).map(index => ({
+            index,
+            letter: quote.q[index],
+          }));
+
+          setGuessedLetters(prefilled);
+          setWrongGuesses([]);
+          await persistProgress(prefilled, []);
         }
-      });
-      setCharMap(mapped);
 
-      // Prefill 10% letters, min 3
-      const letters = mapped.filter(c => c.isLetter);
-      const numToPrefill = Math.max(3, Math.floor(letters.length * 0.1));
-      const chosenIndices = new Set();
+        // Start / resume timer
+        startTimer();
 
-      while (chosenIndices.size < numToPrefill) {
-        const randomIndex = Math.floor(Math.random() * letters.length);
-        chosenIndices.add(letters[randomIndex].index);
+        setShuffledAlphabet(shuffleAlphabet());
+      } catch (e) {
+        console.error('setup error:', e);
+      } finally {
+        if (mounted) setLoading(false);
       }
-
-      const prefilled = Array.from(chosenIndices).map(index => ({
-        index,
-        letter: quote.q[index],
-      }));
-
-      setGuessedLetters(prev => [...prev, ...prefilled]);
     };
 
-    setShuffledAlphabet(shuffleAlphabet());
-    setupQuote();
-    loadProgress().finally(() => setLoading(false));
+    setup();
+    return () => {
+      mounted = false;
+      stopTimer();
+    };
+  }, [levelIndex, quote.q]);
 
-    return stopTimer;
-  }, [quote.q]);
-
+  // ---------- guessing ----------
   const handleConfirmGuess = async () => {
     if (!previewLetter || selectedIndex === null) return;
 
     const lowerGuess = previewLetter.trim().toLowerCase();
     const targetChar = quote.q[selectedIndex];
 
+    // already guessed correctly at this index
     if (guessedLetters.find(g => g.index === selectedIndex)) {
       setPreviewLetter('');
       return;
     }
 
-    let newGuessedLetters = [...guessedLetters];
-    let newWrongGuesses = [...wrongGuesses];
+    let newGuessed = [...guessedLetters];
+    let newWrong = [...wrongGuesses];
 
     if (lowerGuess === targetChar.toLowerCase()) {
-      newGuessedLetters.push({ index: selectedIndex, letter: targetChar });
-      setGuessedLetters(newGuessedLetters);
+      newGuessed.push({ index: selectedIndex, letter: targetChar });
+      setGuessedLetters(newGuessed);
       setLastGuessFeedback({ index: selectedIndex, type: 'correct' });
     } else {
-      newWrongGuesses.push({ index: selectedIndex, letter: lowerGuess });
-      setWrongGuesses(newWrongGuesses);
+      newWrong.push({ index: selectedIndex, letter: lowerGuess });
+      setWrongGuesses(newWrong);
       setLastGuessFeedback({ index: selectedIndex, type: 'wrong' });
     }
 
-    await AsyncStorage.setItem(QUOTE_PROGRESS_KEY, JSON.stringify({
-      guessedLetters: newGuessedLetters,
-      wrongGuesses: newWrongGuesses
-    }));
+    // Persist the single active save (for current level only)
+    await persistProgress(newGuessed, newWrong);
 
     setPreviewLetter('');
     setSelectedIndex(null);
+
+    // ---- Win / Lose checks ----
+    const allLetterIndices = charMap.filter(c => c.isLetter).map(c => c.index);
+    const guessedIndices = newGuessed.map(g => g.index);
+    const won = allLetterIndices.every(i => guessedIndices.includes(i));
+
+    if (won) {
+      stopTimer();
+      await clearActiveSave(); // clear single active save on win
+
+      // Update highest unlocked
+      const saved = await AsyncStorage.getItem(QUOTE_UNLOCK_KEY);
+      let progress = saved ? JSON.parse(saved) : { unlockedLevel: 0 };
+      if (progress.unlockedLevel < levelIndex + 1) {
+        progress.unlockedLevel = levelIndex + 1;
+        await AsyncStorage.setItem(QUOTE_UNLOCK_KEY, JSON.stringify(progress));
+      }
+
+      Alert.alert('🎉 Correct! Level Complete', '', [
+        { text: 'OK', onPress: () => navigation?.goBack?.() },
+      ]);
+      return;
+    }
+
+    if (newWrong.length >= MAX_WRONG) {
+      stopTimer();
+      await clearActiveSave(); // clear single active save on lose
+      Alert.alert('❌ Too many wrong guesses', 'Try again!', [
+        { text: 'OK' },
+      ]);
+      // Reset UI state but keep on same level
+      setGuessedLetters([]);
+      setWrongGuesses([]);
+      setPreviewLetter('');
+      setSelectedIndex(null);
+      await resetTimer();
+      startTimer();
+    }
   };
 
   if (loading) {
@@ -178,7 +267,7 @@ const QuoteScreen = () => {
   }
 
   return (
-    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
+    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
       <TouchableWithoutFeedback onPress={Platform.OS !== 'web' ? Keyboard.dismiss : null}>
         <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
 
@@ -187,63 +276,65 @@ const QuoteScreen = () => {
             {(secondsElapsed % 60).toString().padStart(2, '0')}
           </Text>
 
-          <Text style={styles.wrongCounter}>Wrong guesses: {wrongGuesses.length}</Text>
+          <Text style={styles.wrongCounter}>
+            Wrong guesses: {wrongGuesses.length}/{MAX_WRONG}
+          </Text>
 
           <View style={styles.quoteRow}>
             {Array.from(new Set(charMap.map(c => c.wordIndex))).map(wordIndex => (
               <View key={wordIndex} style={styles.wordBox}>
-                {charMap.filter(c => c.wordIndex === wordIndex).map((c) => {
-                  const guessedObj = guessedLetters.find(g => g.index === c.index);
-                  let displayChar = '_';
-                  if (!c.isLetter) displayChar = c.char;
-                  else if (guessedObj) displayChar = guessedObj.letter;
-                  else if (selectedIndex === c.index && previewLetter) displayChar = previewLetter;
+                {charMap
+                  .filter(c => c.wordIndex === wordIndex)
+                  .map((c) => {
+                    const guessedObj = guessedLetters.find(g => g.index === c.index);
 
-                  const isSelected = selectedIndex === c.index;
-                  const alphabetIndex = c.isLetter ? shuffledAlphabet.indexOf(c.char.toLowerCase()) + 1 : null;
+                    let displayChar = '_';
+                    if (!c.isLetter) displayChar = c.char;
+                    else if (guessedObj) displayChar = guessedObj.letter;
+                    else if (selectedIndex === c.index && previewLetter) displayChar = previewLetter;
 
-                  return (
-                    <Pressable
-                      key={c.index}
-                      onPress={() => {
-                        if (c.isLetter) {
-                          setSelectedIndex(c.index);
-                          setGuess('');
-                          inputRef.current?.focus();
-                        }
-                      }}
-                    >
-                      <Animatable.View
-                        animation={lastGuessFeedback?.index === c.index ? 'bounceIn' : undefined}
-                        duration={1500}
-                        style={[
-                          c.char !== " " && styles.charBox,
-                          isSelected && styles.selectedCharBox,
-                        ]}
+                    const isSelected = selectedIndex === c.index;
+                    const alphabetIndex = c.isLetter
+                      ? shuffledAlphabet.indexOf(c.char.toLowerCase()) + 1
+                      : null;
+
+                    return (
+                      <Pressable
+                        key={c.index}
+                        onPress={() => {
+                          if (c.isLetter) {
+                            setSelectedIndex(c.index);
+                            inputRef.current?.focus();
+                          }
+                        }}
                       >
-                        {lastGuessFeedback?.index === c.index && (
-                          <Animatable.View
-                            animation="fadeOut"
-                            duration={1500}
-                            onAnimationEnd={() => {
-                              if (lastGuessFeedback?.index === c.index) {
-                                setLastGuessFeedback(null);
-                              }
-                            }}
-                            style={[
-                              StyleSheet.absoluteFill,
-                              lastGuessFeedback.type === 'correct' ? styles.correctFade : styles.wrongFade
-                            ]}
-                          />
-                        )}
-                        <Text style={styles.charText}>{displayChar}</Text>
-                        {c.isLetter && (
-                          <Text style={styles.clueText}>{alphabetIndex}</Text>
-                        )}
-                      </Animatable.View>
-                    </Pressable>
-                  );
-                })}
+                        <Animatable.View
+                          animation={lastGuessFeedback?.index === c.index ? 'bounceIn' : undefined}
+                          duration={1500}
+                          style={[
+                            c.char !== ' ' && styles.charBox,
+                            isSelected && styles.selectedCharBox,
+                          ]}
+                        >
+                          {lastGuessFeedback?.index === c.index && (
+                            <Animatable.View
+                              animation="fadeOut"
+                              duration={1500}
+                              onAnimationEnd={() => {
+                                if (lastGuessFeedback?.index === c.index) setLastGuessFeedback(null);
+                              }}
+                              style={[
+                                StyleSheet.absoluteFill,
+                                lastGuessFeedback.type === 'correct' ? styles.correctFade : styles.wrongFade,
+                              ]}
+                            />
+                          )}
+                          <Text style={styles.charText}>{displayChar}</Text>
+                          {c.isLetter && <Text style={styles.clueText}>{alphabetIndex}</Text>}
+                        </Animatable.View>
+                      </Pressable>
+                    );
+                  })}
                 <View style={{ width: 10 }} />
               </View>
             ))}
@@ -265,7 +356,7 @@ const QuoteScreen = () => {
       </TouchableWithoutFeedback>
     </KeyboardAvoidingView>
   );
-};
+}
 
 const styles = StyleSheet.create({
   container: {
@@ -336,5 +427,3 @@ const styles = StyleSheet.create({
     flexShrink: 0,
   },
 });
-
-export default QuoteScreen;

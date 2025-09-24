@@ -7,7 +7,7 @@ const MenuScreen = ({ navigation }) => {
     <View style={styles.container}>
       <Text style={styles.title}>Welcome to LetterMyst</Text>
       
-      <Pressable style={styles.button} onPress={() => navigation.navigate('Game')}>
+      <Pressable style={styles.button} onPress={() => navigation.navigate('Levels')}>
         <Text style={styles.buttonText}>Start Game</Text>
       </Pressable>
 
